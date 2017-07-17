@@ -1,0 +1,10 @@
+> runMain reductions.ParallelParenthesesBalancingRunner
+
+sequential result = true
+sequential balancing time: 3476.222456000001 ms
+
+parallel result = true
+parallel balancing time: 0.4572732500000002 ms
+speedup: 7602.068251313628
+
+
