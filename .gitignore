@@ -1,1 +1,8 @@
 .DS_Store
+/target
+.cache
+.classpath
+.project
+/capstone-project/project/project/
+/capstone-project/project/target/
+/capstone-project/target/
