@@ -1,76 +1,127 @@
 package observatory
 
-import java.time.LocalDate
+import java.lang.Math._
 
-import com.sksamuel.scrimage.RGBColor
+import org.apache.spark.sql.types.DataTypes.{DoubleType, IntegerType}
+import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.sql.{Encoder, Encoders}
 
-import scala.math._
+import scala.math.{Pi, atan, max, min, sinh}
+import scala.reflect.ClassTag
+
+object implicits {
+
+  implicit class DoubleToRGB(value: Double) {
+    def toRGB: Int = max(0, min(255, math.round(value).toInt))
+  }
+
+  implicit class F2C(f: Double) {
+    def toCelsius: Double = (f - 32) * 5 / 9
+  }
+
+  implicit def kryoEncoder[A](implicit ct: ClassTag[A]): Encoder[A] =
+    org.apache.spark.sql.Encoders.kryo[A](ct)
+
+  implicit def tuple3[A1, A2, A3](implicit e1: Encoder[A1], e2: Encoder[A2], e3: Encoder[A3]): Encoder[(A1, A2, A3)] =
+    Encoders.tuple[A1, A2, A3](e1, e2, e3)
+}
 
 case class Location(lat: Double, lon: Double) {
-  lazy val point:Point = Point(toRadians(lat), toRadians(lon))
-}
+  private val R = 6371e3
+  private val p = 2
 
+  private def distanceTo(loc: Location): Double = {
+    val dLat = (loc.lat - lat).toRadians
+    val dLon = (loc.lon - lon).toRadians
 
-/**
-  * Source http://wiki.openstreetmap.org/wiki/Slippy_map_tilenames
-  *
-  * @param x    Point
-  * @param y    Point
-  * @param zoom Zoom Level
-  */
-case class Tile(x: Double, y: Double, zoom: Int) {
-  lazy val location: Location = Location(
-    lat = toDegrees(atan(sinh(Pi * (1.0 - 2.0 * y / (1 << zoom))))),
-    lon = x / (1 << zoom) * 360.0 - 180.0)
+    val a = sin(dLat / 2) * sin(dLat / 2) + cos(lat.toRadians) * cos(loc.lat.toRadians) * sin(dLon / 2) * sin(dLon / 2)
+    val c = 2 * atan2(sqrt(a), sqrt(1 - a))
 
-  def toURI = new java.net.URI("http://tile.openstreetmap.org/" + zoom + "/" + x + "/" + y + ".png")
-}
-
-
-case class Point(ϕ: Double, λ: Double) {
-  lazy val location:Location = Location(toDegrees(ϕ), toDegrees(λ))
-
-  /**
-    * Added for special case: https://www.coursera.org/learn/scala-capstone/discussions/weeks/2/threads/YY0u6Ax8EeeqzRJFs29uDA
-    *
-    * @param other Point for distance calculatuion
-    * @return distance on earth in meters
-    */
-  def haversineEarthDistance(other: Point): Double = {
-    var r = 6372.8 // mean radius Earth in KM
-    r * greatCircleDistance(other) * 1000
+    R * c
   }
 
-  /**
-    * https://en.wikipedia.org/wiki/Great-circle_distance#Computational_formulas
-    *
-    * @param other Point for distance calculatuion
-    * @return distance in radians
-    */
-  def greatCircleDistance(other: Point): Double = {
-    val Δϕ = abs(other.ϕ - ϕ)
-    val Δλ = abs(other.λ - λ)
-
-    val a =  pow(sin(Δϕ / 2), 2) + cos(ϕ) * cos(other.ϕ) * pow(sin(Δλ / 2), 2)
-    2 * atan2(sqrt(a), sqrt(1 - a))
+  def idw(loc: Location): Double = {
+    1 / pow(distanceTo(loc), p)
   }
 
+  def isAt(x: Int, y: Int): Boolean = {
+    lat.toInt == x && lon.toInt == y
+  }
 }
 
+object Location {
+  def fromPixelIndex(index: Int): Location = {
+    def x: Int = index % 360
+    def y: Int = index / 360
 
-case class Color(red: Int, green: Int, blue: Int) {
-  def pixel(alpha: Int = 255) = RGBColor(red, green, blue, alpha).toPixel
+    Location(90 - y, x - 180)
+  }
+
+  def fromPixelIndexZoomXY(index: Int, zoom: Int, x: Int, y: Int): Location = {
+    def x0: Int = (index % 256) / 256 + x
+    def y0: Int = (index / 256) / 256 + y
+
+    val p: Int = 1 << zoom
+
+    def lat: Double = atan(sinh(Pi * (1.0 - 2.0 * y0 / p))) * 180.0 / Pi
+    def lon: Double = x0 * 360.0 / p - 180.0
+
+    Location(lat, lon)
+  }
 }
 
-case class Joined(id: String, latitude:Double, longitude: Double, day: Int, month: Int, year: Int, temperature: Double)
+case class Color(red: Int, green: Int, blue: Int)
 
-case class StationDate(day: Int, month: Int, year: Int){
-  def toLocalDate = LocalDate.of(year, month, day)
+//case class Station(stn: Int, wban: Int, lat: Double, lon: Double)
+//object Station {
+//  def valid(fields: Array[String]): Boolean = {
+//    fields.length == 4 && fields(2).nonEmpty && fields(3).nonEmpty
+//  }
+//  def parse(fields: Array[String]): Station = {
+//    Station(
+//      stn = Try(fields(0).toInt).getOrElse(0),
+//      wban = Try(fields(1).toInt).getOrElse(0),
+//      lat = fields(2).toDouble,
+//      lon = fields(3).toDouble)
+//  }
+//}
+
+case class Station(stn: Option[Int], wban: Option[Int], lat: Option[Double], lon: Option[Double])
+
+object Station {
+
+  val structType = StructType(Seq(
+    StructField("stn", IntegerType, nullable = true),
+    StructField("wban", IntegerType, nullable = true),
+    StructField("lat", DoubleType, nullable = true),
+    StructField("lon", DoubleType, nullable = true)
+  ))
 }
 
-case class JoinedFormat(date: StationDate, location: Location, temperature: Double)
+//case class Record(stn: Int, wban: Int, month: Int, day: Int, temp: Double)
+//object Record {
+//  def valid(fields: Array[String]): Boolean = {
+//    fields.length == 5 && fields(2).nonEmpty && fields(3).nonEmpty && fields(4).nonEmpty
+//  }
+//  def parse(fields: Array[String]): Record = {
+//    Record(
+//      stn = Try(fields(0).toInt).getOrElse(0),
+//      wban = Try(fields(1).toInt).getOrElse(0),
+//      month = fields(2).toInt,
+//      day = fields(3).toInt,
+//      temp = fields(4).toCelsius)
+//  }
+//}
 
+case class Record(stn: Option[Int], wban: Option[Int], month: Int, day: Int, temp: Double)
 
-case class Station(id: String, latitude: Double, longitude: Double)
+object Record {
+  val structType = StructType(Seq(
+    StructField("stn", IntegerType, nullable = true),
+    StructField("wban", IntegerType, nullable = true),
+    StructField("month", IntegerType, nullable = false),
+    StructField("day", IntegerType, nullable = false),
+    StructField("temp", DoubleType, nullable = false)
+  ))
+}
 
-case class TemperatureRecord(id: String, day: Int, month: Int, year: Int, temperature: Double)

@@ -6,3 +6,5 @@
 /capstone-project/project/project/
 /capstone-project/project/target/
 /capstone-project/target/
+metastore_db
+*.log

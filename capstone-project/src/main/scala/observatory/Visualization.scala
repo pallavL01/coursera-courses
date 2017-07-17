@@ -1,42 +1,16 @@
 package observatory
 
-import com.sksamuel.scrimage.Image
+import com.sksamuel.scrimage.{Image, Pixel, RGBColor}
 
-import scala.collection._
-import scala.math._
+import scala.collection.parallel.ForkJoinTaskSupport
+import scala.concurrent.forkjoin.ForkJoinPool
 
 /**
   * 2nd milestone: basic visualization
   */
 object Visualization {
 
-  /**
-    * @param temperatures Known temperatures
-    * @param colors       Color scale
-    * @return A 360×180 image where each pixel shows the predicted temperature at its location
-    */
-  def visualize(temperatures: Iterable[(Location, Double)], colors: Iterable[(Double, Color)]): Image = {
-    val imageWidth = 360
-    val imageHeight = 180
-
-    val locationMap = posToLocation(imageWidth, imageHeight) _
-
-    val pixels = (0 until imageHeight * imageWidth).par.map {
-      pos =>
-        pos -> interpolateColor(
-          colors,
-          predictTemperature(
-            temperatures,
-            locationMap(pos)
-          )
-        ).pixel()
-    }
-      .seq
-      .sortBy(_._1)
-      .map(_._2)
-
-    Image(imageWidth, imageHeight, pixels.toArray)
-  }
+  private val taskSupport = new ForkJoinTaskSupport(new ForkJoinPool(8))
 
   /**
     * @param temperatures Known temperatures: pairs containing a location and the temperature at this location
@@ -44,41 +18,21 @@ object Visualization {
     * @return The predicted temperature at `location`
     */
   def predictTemperature(temperatures: Iterable[(Location, Double)], location: Location): Double = {
-    val predictions: Iterable[(Double, Double)] = distanceTemperatureCombi(temperatures, location)
-
-    predictions.find(_._1 == 0.0) match {
-      case Some((_, temp)) => temp
-      case _ => inverseDistanceWeighted(predictions, power = 3)
-    }
+    temperatures
+      .find(_._1 == location)
+      .map(_._2)
+      .getOrElse(inverseDistanceWeighting(temperatures, location))
   }
 
-  def distanceTemperatureCombi(temperatures: Iterable[(Location, Double)], location: Location): Iterable[(Double, Double)] = {
-    temperatures.map {
-      case (otherLocation, temperature) => (location.point haversineEarthDistance otherLocation.point, temperature)
-    }
-  }
-
-  /**
-    * https://en.wikipedia.org/wiki/Inverse_distance_weighting
-    *
-    * @param distanceTemperatureCombinations
-    * @param power
-    * @return
-    */
-  def inverseDistanceWeighted(distanceTemperatureCombinations: Iterable[(Double, Double)], power: Int): Double = {
-    val (weightedSum, inverseWeightedSum) = distanceTemperatureCombinations
-      .aggregate((0.0, 0.0))(
-        {
-          case ((ws, iws), (distance, temp)) => {
-            val w = 1 / pow(distance, power)
-            (w * temp + ws, w + iws)
-          }
-        }, {
-          case ((wsA, iwsA), (wsB, iwsB)) => (wsA + wsB, iwsA + iwsB)
-        }
-      )
-
-    weightedSum / inverseWeightedSum
+  private def inverseDistanceWeighting(temperatures: Iterable[(Location, Double)], location: Location): Double = {
+    def op(dd1: (Double, Double), dd2: (Double, Double)) = (dd1._1 + dd2._1, dd1._2 + dd2._2)
+    val result: (Double, Double) = temperatures
+      .map(t => {
+        val idw = location.idw(t._1)
+        (t._2 * idw, idw)
+      })
+      .aggregate[(Double, Double)]((0.0, 0.0))(op, op)
+    result._1 / result._2
   }
 
   /**
@@ -87,84 +41,44 @@ object Visualization {
     * @return The color that corresponds to `value`, according to the color scale defined by `points`
     */
   def interpolateColor(points: Iterable[(Double, Color)], value: Double): Color = {
-    points.find(_._1 == value) match {
-      case Some((_, color)) => color
-      case None => {
-        val (smaller, greater) = points.toList.sortBy(_._1).partition(_._1 < value)
-        linearInterpolation(smaller.reverse.headOption, greater.headOption, value)
-      }
+    val ps = points.toSeq
+    ps.indexWhere(_._1 >= value) match {
+      case -1 => interpolate(points.init.last, points.last, value)
+      case  0 => interpolate(points.head, points.tail.head, value)
+      case  x => interpolate(ps(x - 1), ps(x), value)
     }
   }
 
-  /**
-    * Calculates the color based on linear interpolation of the value between ColorPoint A and ColorPointB
-    *
-    * @param pointA tuple of value & color
-    * @param pointB tuple of value & color
-    * @param value  for interpolation
-    * @return Color
-    */
-  def linearInterpolation(pointA: Option[(Double, Color)], pointB: Option[(Double, Color)], value: Double): Color = (pointA, pointB) match {
-    case (Some((pAValue, pAColor)), Some((pBValue, pBColor))) => {
-      val li = linearInterpolationValue(pAValue, pBValue, value) _
-      Color(
-        li(pAColor.red, pBColor.red),
-        li(pAColor.green, pBColor.green),
-        li(pAColor.blue, pBColor.blue)
-      )
-    }
-    case (Some(pA), None) => pA._2
-    case (None, Some(pB)) => pB._2
-    case _ => Color(0, 0, 0)
+  private def interpolate(p1: (Double, Color), p2: (Double, Color), value: Double): Color = {
+    import observatory.implicits._
+    Color(
+      interpolate(p1._1, p1._2.red,   p2._1, p2._2.red,   value).toRGB,
+      interpolate(p1._1, p1._2.green, p2._1, p2._2.green, value).toRGB,
+      interpolate(p1._1, p1._2.blue,  p2._1, p2._2.blue,  value).toRGB
+    )
+  }
+
+  private def interpolate(temp1: Double, rgbp1: Int, temp2: Double, rgbp2: Int, value: Double): Double = {
+    rgbp1 + (value - temp1) * (rgbp2 - rgbp1) / (temp2 - temp1)
   }
 
   /**
-    * (Partial) function that calculates a transformed value based on source range & source value (actual values) to target range (color value)
-    *
-    * @param pointValueMin value at point A
-    * @param pointValueMax value at point B
-    * @param value         between A & B
-    * @param colorValueMin target range lowerbound
-    * @param colorValueMax target range upperbound
-    * @return inperpolated value
+    * @param temperatures Known temperatures
+    * @param colors       Color scale
+    * @return A 360×180 image where each pixel shows the predicted temperature at its location
     */
-  def linearInterpolationValue(pointValueMin: Double, pointValueMax: Double, value: Double)(colorValueMin: Int, colorValueMax: Int): Int = {
-    val factor = (value - pointValueMin) / (pointValueMax - pointValueMin)
-
-    round(colorValueMin + (colorValueMax - colorValueMin) * factor).toInt
+  def visualize(temperatures: Iterable[(Location, Double)], colors: Iterable[(Double, Color)]): Image = {
+    Image(360, 180, pixels(temperatures, colors))
   }
 
-  /**
-    * (Partial) function that returns a Location based on a position in an image  (starting from top left (90.0, -180.0 | 0, 0) moving right -> down), taking in account the image dimensions
-    *
-    * @param imageWidth  pixels
-    * @param imageHeight pixels
-    * @param pos         withing image as y * imageWidth + x
-    * @return Location (lat long)
-    */
-  def posToLocation(imageWidth: Int, imageHeight: Int)(pos: Int): Location = {
-    val widthFactor = 180 * 2 / imageWidth.toDouble
-    val heightFactor = 90 * 2 / imageHeight.toDouble
-
-    val x: Int = pos % imageWidth
-    val y: Int = pos / imageWidth
-
-    Location(90 - (y * heightFactor), (x * widthFactor) - 180)
+  private def pixels(temperatures: Iterable[(Location, Double)], colors: Iterable[(Double, Color)]): Array[Pixel] = {
+    val idxPar = (0 until (360 * 180)).par
+    idxPar.tasksupport = taskSupport
+    idxPar
+      .map(idx => Location.fromPixelIndex(idx))
+      .map(loc => predictTemperature(temperatures, loc))
+      .map(tmp => interpolateColor(colors, tmp))
+      .map(col => Pixel(RGBColor(col.red, col.green, col.blue)))
+      .toArray
   }
-
-  def distance(locA: Location, locB: Location): Double = {
-    val Location(latA, lonA) = locA
-    val Location(latB, lonB) = locB
-    val latDistance = toRadians(latB - latA)
-    val lonDistance = toRadians(lonB - lonA)
-
-    val a = pow(sin(latDistance / 2), 2) +
-      cos(toRadians(latA)) * cos(toRadians(latB)) *
-        pow(sin(lonDistance / 2), 2)
-
-    val c = 2 * atan2(sqrt(a), sqrt(1 - a))
-    c * 6371
-  }
-
 }
-
